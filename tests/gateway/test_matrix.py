@@ -3342,3 +3342,89 @@ class TestCryptoPickleKeyMigration:
         # start still sees a legacy-key account and retries the migration.
         store.put_account.assert_not_awaited()
         assert "retried on the next start" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Outbound notification policy (MATRIX_NOTIFICATIONS / #80467)
+# ---------------------------------------------------------------------------
+
+
+class TestMatrixNotificationsPolicy:
+    """Intermediate output can be made visible-but-silent (m.notice) or
+    suppressed entirely, while final responses always notify normally."""
+
+    def _make_with_mode(self, mode: str):
+        from plugins.platforms.matrix.adapter import MatrixAdapter
+
+        config = PlatformConfig(
+            enabled=True,
+            token="syt_test_token",
+            extra={
+                "homeserver": "https://matrix.example.org",
+                "user_id": "@bot:example.org",
+                "notifications": mode,
+            },
+        )
+        adapter = MatrixAdapter(config)
+        mock_client = MagicMock()
+        mock_client.send_message_event = AsyncMock(return_value="$evt")
+        adapter._client = mock_client
+        return adapter, mock_client
+
+    @pytest.mark.asyncio
+    async def test_notifications_normal_sends_intermediate_as_m_text(self):
+        adapter, mock_client = self._make_with_mode("normal")
+        result = await adapter.send("!room:example.org", "thinking…")
+        assert result.success is True
+        sent = mock_client.send_message_event.await_args.args[2]
+        assert sent["msgtype"] == "m.text"
+
+    @pytest.mark.asyncio
+    async def test_notifications_silent_sends_intermediate_as_m_notice(self):
+        adapter, mock_client = self._make_with_mode("silent")
+        result = await adapter.send("!room:example.org", "searching the web…")
+        assert result.success is True
+        sent = mock_client.send_message_event.await_args.args[2]
+        assert sent["msgtype"] == "m.notice"
+
+    @pytest.mark.asyncio
+    async def test_notifications_silent_keeps_final_response_as_m_text(self):
+        adapter, mock_client = self._make_with_mode("silent")
+        result = await adapter.send(
+            "!room:example.org", "Here is the answer.", metadata={"notify": True}
+        )
+        assert result.success is True
+        sent = mock_client.send_message_event.await_args.args[2]
+        assert sent["msgtype"] == "m.text"
+
+    @pytest.mark.asyncio
+    async def test_notifications_off_skips_intermediate_but_sends_final(self):
+        adapter, mock_client = self._make_with_mode("off")
+
+        intermediate = await adapter.send("!room:example.org", "loading…")
+        assert intermediate.success is True
+        mock_client.send_message_event.assert_not_awaited()
+
+        final = await adapter.send(
+            "!room:example.org", "Done.", metadata={"notify": True}
+        )
+        assert final.success is True
+        sent = mock_client.send_message_event.await_args.args[2]
+        assert sent["msgtype"] == "m.text"
+
+    def test_notifications_mode_resolved_from_env(self, monkeypatch):
+        from plugins.platforms.matrix.adapter import MatrixAdapter
+
+        monkeypatch.setenv("MATRIX_NOTIFICATIONS", "silent")
+        adapter = _make_adapter()
+        assert adapter._notifications_mode == "silent"
+
+    def test_notifications_mode_invalid_falls_back_to_normal(self):
+        adapter, _ = self._make_with_mode("bogus")
+        assert adapter._notifications_mode == "normal"
+
+    def test_notifications_appears_in_diagnostics(self):
+        adapter = _make_adapter()
+        diag = adapter.get_diagnostics()
+        assert diag["policy"]["notifications"] == "normal"
+

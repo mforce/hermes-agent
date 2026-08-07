@@ -29,6 +29,15 @@ Environment variables:
                                 bridge ghost user IDs to ignore
     MATRIX_PROCESS_NOTICES      Set "true" to process inbound m.notice events
                                 (default: false)
+    MATRIX_NOTIFICATIONS        Outbound push-notification policy:
+                                "normal" | "silent" | "off" (default: normal).
+                                "silent" sends intermediate output (tool
+                                progress, thinking, status) as m.notice — the
+                                Matrix "does not push" msgtype — so Element
+                                Android shows them without vibrating, while
+                                final responses still notify normally. "off"
+                                omits intermediate output entirely; only final
+                                responses are posted. Matrix-specific.
     MATRIX_ALLOW_ROOM_MENTIONS  Allow outbound @room mentions to notify whole rooms
                                 (default: false)
     MATRIX_TOOLS_ALLOW_REDACTION
@@ -1204,6 +1213,18 @@ class MatrixAdapter(BasePlatformAdapter):
             "MATRIX_PROCESS_NOTICES", "false"
         ).lower() in ("true", "1", "yes")
 
+        # Outbound notification policy for text sends. Mirrors Telegram's
+        # "important" notification mode but on Matrix's own lever: m.notice is
+        # the conventional "don't push / no vibration" msgtype on Element.
+        #   "normal" -> every message sends as m.text (legacy behavior).
+        #   "silent" -> intermediate output (non-``notify`` sends: tool
+        #               progress, thinking, status) sends as m.notice, so it
+        #               stays visible in the room without notifying; final
+        #               responses (``metadata["notify"]=True``) still notify.
+        #   "off"    -> intermediate output is skipped entirely; only
+        #               ``notify=True`` messages are posted.
+        self._notifications_mode: str = self._resolve_notifications_mode(config)
+
         # Reactions: configurable via MATRIX_REACTIONS (default: true).
         self._reactions_enabled: bool = os.getenv(
             "MATRIX_REACTIONS", "true"
@@ -1329,6 +1350,33 @@ class MatrixAdapter(BasePlatformAdapter):
         return os.getenv(
             "MATRIX_THREAD_REQUIRE_MENTION", "false"
         ).lower() in {"true", "1", "yes", "on"}
+
+    @staticmethod
+    def _resolve_notifications_mode(config) -> str:
+        """Resolve the outbound notification policy from config/env.
+
+        Priority: ``config.extra[\"notifications\"]`` (mapped from config.yaml
+        ``platforms.matrix.notifications`` via ``_apply_yaml_config``), then
+        the ``MATRIX_NOTIFICATIONS`` env var, then ``\"normal\"``. Any
+        unrecognized value falls back to ``\"normal\"`` so a typo never
+        silently swallows final responses.
+        """
+        raw = None
+        extra = getattr(config, "extra", None) or {}
+        if isinstance(extra, dict):
+            raw = extra.get("notifications")
+        if raw is None:
+            raw = os.getenv("MATRIX_NOTIFICATIONS")
+        if raw is None:
+            return "normal"
+        if isinstance(raw, bool):
+            return "normal" if raw else "off"
+        val = str(raw).strip().lower()
+        if val in {"true", "1", "yes", "on", "all"}:
+            return "normal"
+        if val in {"false", "0", "no"}:
+            return "off"
+        return val if val in {"normal", "silent", "off"} else "normal"
 
     # ------------------------------------------------------------------
     # E2EE helpers
@@ -2091,17 +2139,39 @@ class MatrixAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """Send a message to a Matrix room."""
+        """Send a message to a Matrix room.
 
+        Applies the ``MATRIX_NOTIFICATIONS`` outbound policy (#80467):
+        messages marked ``metadata[\"notify\"]=True`` (final responses,
+        approvals, slash confirmations) always send as a normal ``m.text``;
+        intermediate output is either delivered as ``m.notice`` (silent mode)
+        or omitted (off mode) so Element Android doesn't vibrate for every
+        tool-progress / thinking update.
+        """
         if not content:
             return SendResult(success=True)
+
+        is_final = bool((metadata or {}).get("notify"))
+        policy = getattr(self, "_notifications_mode", "normal")
+        if not is_final and policy == "off":
+            # Visible-but-not-notifying is off entirely: drop intermediate
+            # output so only final responses reach the room. Reported success
+            # mirrors the empty-content no-op so callers stay happy.
+            logger.debug("Matrix: notifications=off; skipping intermediate send")
+            return SendResult(success=True)
+
+        # "silent" delivers intermediate output as m.notice — the Matrix
+        # msgtype that clients render without a notification/vibration.
+        msgtype = "m.text"
+        if not is_final and policy == "silent":
+            msgtype = "m.notice"
 
         formatted = self.format_message(content)
         chunks = self.truncate_message(formatted, self.max_message_length)
 
         last_event_id = None
         for i, chunk in enumerate(chunks):
-            msg_content = self._build_text_message_content(chunk)
+            msg_content = self._build_text_message_content(chunk, msgtype=msgtype)
 
             self._apply_relation_metadata(msg_content, reply_to=reply_to, metadata=metadata)
 
@@ -2195,6 +2265,7 @@ class MatrixAdapter(BasePlatformAdapter):
                 "free_response_room_count": len(self._free_rooms),
                 "allow_room_mentions": self._allow_room_mentions,
                 "process_notices": self._process_notices,
+                "notifications": self._notifications_mode,
                 "allow_public_rooms": os.getenv("MATRIX_ALLOW_PUBLIC_ROOMS", "").lower()
                 in ("true", "1", "yes"),
             },
@@ -5261,6 +5332,8 @@ def _apply_yaml_config(yaml_cfg: dict, matrix_cfg: dict) -> dict | None:
         os.environ["MATRIX_IGNORE_USER_PATTERNS"] = str(ignore_patterns)
     if "process_notices" in matrix_cfg and not os.getenv("MATRIX_PROCESS_NOTICES"):
         os.environ["MATRIX_PROCESS_NOTICES"] = str(matrix_cfg["process_notices"]).lower()
+    if "notifications" in matrix_cfg and not os.getenv("MATRIX_NOTIFICATIONS"):
+        os.environ["MATRIX_NOTIFICATIONS"] = str(matrix_cfg["notifications"]).lower()
     if "session_scope" in matrix_cfg and not os.getenv("MATRIX_SESSION_SCOPE"):
         os.environ["MATRIX_SESSION_SCOPE"] = str(matrix_cfg["session_scope"]).lower()
     if "auto_thread" in matrix_cfg and not os.getenv("MATRIX_AUTO_THREAD"):

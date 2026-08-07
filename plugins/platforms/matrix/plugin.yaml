@@ -39,3 +39,7 @@ optional_env:
     description: "Display name for the Matrix home room"
     prompt: "Home room display name"
     password: false
+  - name: MATRIX_NOTIFICATIONS
+    description: "Outbound push-notification policy: normal | silent | off (default normal). 'silent' sends tool-progress/intermediate updates as m.notice (no vibration); 'off' omits them entirely."
+    prompt: "Notification policy (normal/silent/off)"
+    password: false
